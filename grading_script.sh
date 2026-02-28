@@ -1,171 +1,115 @@
 #!/bin/bash
-# grading_script.sh — improved, safer, cleaner output
-# Usage examples:
-#   sudo ./grading_script.sh
-#   SAMPLE_DIR=/home/mininet/test3/sample_code sudo ./grading_script.sh
-#   QUIET=1 sudo ./grading_script.sh
-
-set -Eeuo pipefail
 
 # -----------------------------
-# Config (override via env vars)
-# -----------------------------
-SAMPLE_DIR="${SAMPLE_DIR:-/root/sample_code}"
-QUIET="${QUIET:-0}"              # 1 = print only WARN/FAIL/ERROR/FATAL + final summary
-INIT_WAIT_SEC="${INIT_WAIT_SEC:-5}"
-BACKEND_PORT="${BACKEND_PORT:-6000}"
-LB_PORT="${LB_PORT:-5000}"
-REQ_COUNT="${REQ_COUNT:-100}"
-
-# Output files
-GRADES_CSV="${GRADES_CSV:-grades.csv}"
-
-# -----------------------------
-# Logging helpers
+# Pretty logging (no new deps)
 # -----------------------------
 ts() { date +"%Y-%m-%d %H:%M:%S"; }
-
-log() {
-  local lvl="$1"; shift
-  local msg="$*"
-
-  if [[ "$QUIET" == "1" ]]; then
-    case "$lvl" in
-      WARN|FAIL|ERROR|FATAL) printf "[%s] [%s] %s\n" "$(ts)" "$lvl" "$msg" ;;
-      *) : ;;
-    esac
-  else
-    printf "[%s] [%s] %s\n" "$(ts)" "$lvl" "$msg"
-  fi
-}
-
-die() { log FATAL "$*"; exit 1; }
-
-step() { log INFO "$*"; }
-
-pass() { log PASS "$*"; }
-
-warn() { log WARN "$*"; }
-
-fail() { log FAIL "$*"; }
+log() { echo "[$(ts)] [$1] $2"; }
+INFO() { log "INFO" "$1"; }
+PASS() { log "PASS" "$1"; }
+FAIL() { log "FAIL" "$1"; }
+WARN() { log "WARN" "$1"; }
+ERROR() { log "ERROR" "$1"; }
 
 # -----------------------------
-# Cleanup (always runs)
+# Config
 # -----------------------------
-RUN_DIR=""
-cleanup() {
-  local ec=$?
-  if [[ -n "${RUN_DIR:-}" && -d "${RUN_DIR:-}" ]]; then
-    # keep logs by default; only remove if user wants
-    : # no-op
-  fi
+INIT_WAIT_SEC="${INIT_WAIT_SEC:-5}"
+REQ_COUNT="${REQ_COUNT:-100}"
+BACKEND_PORT="${BACKEND_PORT:-6000}"
+LB_PORT="${LB_PORT:-5000}"
+GRADES_CSV="${GRADES_CSV:-grades.csv}"
 
-  # Clean Mininet + tmux grading session (best-effort)
-  sudo mn -c > /dev/null 2>&1 || true
-  tmux kill-session -t mn > /dev/null 2>&1 || true
+# If SAMPLE_DIR not explicitly set, auto-detect it
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SAMPLE_DIR="${SAMPLE_DIR:-}"
 
-  if [[ $ec -ne 0 ]]; then
-    log ERROR "Script exited with code $ec"
-    if [[ -n "${RUN_DIR:-}" ]]; then
-      log ERROR "Run artifacts kept at: $RUN_DIR"
-    fi
+detect_sample_dir() {
+  # Priority:
+  # 1) Explicit SAMPLE_DIR (env)
+  # 2) ./sample_code (inside repo)
+  # 3) ./sample-code (common variant)
+  # 4) /root/sample_code (original assumption)
+  # 5) /home/mininet/sample_code (common)
+  if [ -n "$SAMPLE_DIR" ] && [ -d "$SAMPLE_DIR" ]; then
+    echo "$SAMPLE_DIR"; return 0
   fi
+  if [ -d "$SCRIPT_DIR/sample_code" ]; then
+    echo "$SCRIPT_DIR/sample_code"; return 0
+  fi
+  if [ -d "$SCRIPT_DIR/sample-code" ]; then
+    echo "$SCRIPT_DIR/sample-code"; return 0
+  fi
+  if [ -d "/root/sample_code" ]; then
+    echo "/root/sample_code"; return 0
+  fi
+  if [ -d "/home/mininet/sample_code" ]; then
+    echo "/home/mininet/sample_code"; return 0
+  fi
+  echo "" ; return 1
 }
-trap cleanup EXIT
+
+SAMPLE_DIR="$(detect_sample_dir || true)"
 
 # -----------------------------
-# Small utilities
+# Helpers
 # -----------------------------
-require_cmd() {
-  command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
+find_pid() {
+  # returns first matching pid for mininet:<name>
+  pgrep -f "mininet:$1" | head -n1
 }
 
-find_mn_pid() {
-  # Try to return a single PID for mininet:<name>
-  local name="$1"
-  local p
-  p="$(pgrep -f "mininet:${name}" | head -n1 || true)"
-  [[ -n "$p" ]] || return 1
-  echo "$p"
-}
-
-pct() {
-  # Print percentage with 2 decimals: pct correct total
-  local correct="$1"
-  local total="$2"
-  if [[ "$total" -eq 0 ]]; then
-    echo "0.00"
-    return
-  fi
-  awk -v c="$correct" -v t="$total" 'BEGIN{printf "%.2f", (c/t)*100.0}'
-}
-
-safe_grade_from_verify() {
-  # Extract grade integer from "Score: X/Y"
-  # If missing/parse fails -> 0
-  local verify_out="$1"
+grade_from_verify() {
+  # Extract integer X from "Score: X/Y"
+  # If missing -> 0 (NO BLANK GRADES)
+  local file="$1"
   local g
-  g="$(echo "$verify_out" | awk '/Score:/ {print $2}' | head -n1 | cut -d/ -f1 || true)"
-  if [[ -z "${g:-}" ]]; then
+  g="$(python3 verify_output.py "$file" 2>/dev/null | awk '/Score:/ {print $2}' | head -n1 | cut -d/ -f1)"
+  if [ -z "$g" ]; then
     echo "0"
   else
     echo "$g"
   fi
 }
 
-# -----------------------------
-# Preflight
-# -----------------------------
-require_cmd tmux
-require_cmd pgrep
-require_cmd mnexec
-require_cmd awk
-require_cmd python3
-require_cmd ifconfig
-require_cmd ping
-
-RUN_DIR="$(mktemp -d /tmp/mn_grade.XXXXXX)"
-LOG_DIR="$RUN_DIR/logs"
-mkdir -p "$LOG_DIR"
-
-step "Run directory: $RUN_DIR"
-step "Using SAMPLE_DIR=$SAMPLE_DIR"
-step "QUIET=$QUIET"
+tail_log() {
+  local f="$1"
+  if [ -f "$f" ]; then
+    echo "----- tail -n 20 $f -----"
+    tail -n 20 "$f"
+    echo "--------------------------"
+  else
+    echo "----- $f does not exist -----"
+  fi
+}
 
 # -----------------------------
-# STEP 1: Create grades.csv
+# STEP 1: grades.csv
 # -----------------------------
-step "STEP 1 — Creating output file \"$GRADES_CSV\""
-echo "INTERFACE_GRADE_PCT, NETWORK_GRADE_PCT, SINGLE_REQ_GRADE_1, SINGLE_REQ_GRADE_2, SINGLE_REQ_GRADE_3, SINGLE_REQ_GRADE_4, SINGLE_REQ_GRADE_5, SINGLE_REQ_GRADE_6, MULTI_REQ_GRADE_1, MULTI_REQ_GRADE_2, MULTI_REQ_GRADE_3" > "$GRADES_CSV"
+INFO "STEP 1] CREATING OUTPUT FILE \"$GRADES_CSV\""
+echo "INTERFACE_GRADE, NETWORK_GRADE, SINGLE_REQ_GRADE_1, SINGLE_REQ_GRADE_2, SINGLE_REQ_GRADE_3, SINGLE_REQ_GRADE_4, SINGLE_REQ_GRADE_5, SINGLE_REQ_GRADE_6, MULTI_REQ_GRADE_1, MULTI_REQ_GRADE_2, MULTI_REQ_GRADE_3" > "$GRADES_CSV"
 
 # -----------------------------
-# STEP 2: Load topology
+# STEP 2: load topology (same)
 # -----------------------------
-step "STEP 2 — Loading student topology"
+INFO "STEP 2] LOADING STUDENT TOPOLOGY"
 if ! tmux has-session -t mn 2>/dev/null; then
   tmux new-session -d -s mn 'sudo python3 lab_topology.py'
-  log INFO "Started tmux session 'mn' running lab_topology.py"
 else
-  log INFO "tmux session 'mn' already exists; continuing"
+  INFO "tmux session 'mn' already exists, continuing..."
 fi
 
-step "Waiting $INIT_WAIT_SEC seconds for Mininet initialization"
+INFO "WAITING MININET INITIALIZATION ($INIT_WAIT_SEC s)"
 sleep "$INIT_WAIT_SEC"
 
-# -----------------------------
-# STEP 2.5: Cleanup previous artifacts
-# -----------------------------
-step "Cleaning up previous run output"
-rm -f /tmp/student_id.csv || true
-rm -rf /tmp/mininet_request_ids || true
-
-# Run-local copies (for debugging)
-STUDENT_ID_CSV="/tmp/student_id.csv"
+INFO "CLEANING UP PREVIOUS RUN OUTPUT"
+rm -f /tmp/student_id.csv
+rm -rf /tmp/mininet_request_ids
 
 # -----------------------------
-# STEP 3: IP configuration check
+# STEP 3: IP check
 # -----------------------------
-step "STEP 3 — Running IP configuration check"
+INFO "STEP 3] RUNNING IP CONFIGURATION CHECK"
 
 declare -A expected_ips=(
   [h1]="10.0.0.2"
@@ -191,241 +135,221 @@ declare -A ips=(
 
 ip_check_total=0
 ip_check_correct=0
+connectivity_total=0
+connectivity_correct=0
 
-# Hosts and backends: single interface eth0
 for host in h1 h2 h3 b1 b2 b3; do
-  if ! pid="$(find_mn_pid "$host")"; then
-    fail "PID not found for $host"
+  pid="$(find_pid "$host")"
+  if [ -z "$pid" ]; then
+    ERROR "PID not found for $host"
     continue
   fi
-
-  ip="$(mnexec -a "$pid" ifconfig "${host}-eth0" | grep 'inet ' | awk '{print $2}' || true)"
+  ip="$(mnexec -a "$pid" ifconfig "${host}-eth0" 2>/dev/null | grep 'inet ' | awk '{print $2}')"
   ips["$host"]="$ip"
   expected="${expected_ips[$host]}"
-
-  ((ip_check_total++))
-  if [[ "$ip" == "$expected" ]]; then
-    ((ip_check_correct++))
-    pass "$host = $ip (expected $expected)"
+  ip_check_total=$((ip_check_total+1))
+  if [ "$ip" = "$expected" ]; then
+    ip_check_correct=$((ip_check_correct+1))
+    PASS "$host = $ip (expected $expected)"
   else
-    fail "$host = $ip (expected $expected)"
+    FAIL "$host = $ip (expected $expected)"
   fi
 done
 
-# Load balancer: two interfaces
-if lb_pid="$(find_mn_pid "lb")"; then
+lb_pid="$(find_pid "lb")"
+if [ -n "$lb_pid" ]; then
   for intf in eth0 eth1; do
-    ip="$(mnexec -a "$lb_pid" ifconfig "lb-$intf" | grep 'inet ' | awk '{print $2}' || true)"
+    ip="$(mnexec -a "$lb_pid" ifconfig "lb-$intf" 2>/dev/null | grep 'inet ' | awk '{print $2}')"
     key="lb_$intf"
     ips["$key"]="$ip"
     expected="${expected_ips[$key]}"
-
-    ((ip_check_total++))
-    if [[ "$ip" == "$expected" ]]; then
-      ((ip_check_correct++))
-      pass "$key = $ip (expected $expected)"
+    ip_check_total=$((ip_check_total+1))
+    if [ "$ip" = "$expected" ]; then
+      ip_check_correct=$((ip_check_correct+1))
+      PASS "$key = $ip (expected $expected)"
     else
-      fail "$key = $ip (expected $expected)"
+      FAIL "$key = $ip (expected $expected)"
     fi
   done
 else
-  fail "PID not found for lb"
+  ERROR "PID not found for lb"
 fi
 
-log INFO "IP CHECK: $ip_check_correct / $ip_check_total ($(pct "$ip_check_correct" "$ip_check_total")%)"
+INFO "IP CHECK: $ip_check_correct / $ip_check_total"
 
 # -----------------------------
-# STEP 4: Connectivity check
+# STEP 4: connectivity
 # -----------------------------
-step "STEP 4 — Running connectivity check"
-
-connectivity_total=0
-connectivity_correct=0
+INFO "STEP 4] RUNNING CONNECTIVITY CHECK"
 
 clients=("h1" "h2" "h3")
 backends=("b1" "b2" "b3")
 
 for source in "${clients[@]}" "${backends[@]}"; do
-  if ! pid="$(find_mn_pid "$source")"; then
-    fail "PID not found for $source"
+  pid="$(find_pid "$source")"
+  if [ -z "$pid" ]; then
+    ERROR "PID not found for $source"
     continue
   fi
 
   for dest in "${clients[@]}" "${backends[@]}" lb_eth0 lb_eth1; do
-    [[ "$source" == "$dest" ]] && continue
+    [ "$source" = "$dest" ] && continue
 
-    # Skip client → lb_eth1 and backend → lb_eth0
-    if [[ " ${clients[*]} " =~ " $source " && "$dest" == "lb_eth1" ]]; then
+    if [[ " ${clients[*]} " =~ " $source " && "$dest" = "lb_eth1" ]]; then
       continue
     fi
-    if [[ " ${backends[*]} " =~ " $source " && "$dest" == "lb_eth0" ]]; then
-      continue
-    fi
-
-    # Skip if no IP
-    if [[ -z "${ips[$dest]:-}" || "${ips[$dest]}" == "0.0.0.0" ]]; then
-      warn "No IP for $dest; skipping $source → $dest"
+    if [[ " ${backends[*]} " =~ " $source " && "$dest" = "lb_eth0" ]]; then
       continue
     fi
 
-    # Determine expected loss
+    if [ -z "${ips[$dest]}" ] || [ "${ips[$dest]}" = "0.0.0.0" ]; then
+      WARN "No IP for $dest; skipping $source → $dest"
+      continue
+    fi
+
+    result="$(mnexec -a "$pid" ping -c 2 -w 2 "${ips[$dest]}" 2>/dev/null | grep -oP '\d+(?=% packet loss)' | head -n1)"
+    [ -z "$result" ] && result=100
+
     expected=100
     if [[ " ${clients[*]} " =~ " $source " && " ${clients[*]} " =~ " $dest " ]]; then
       expected=0
     elif [[ " ${backends[*]} " =~ " $source " && " ${backends[*]} " =~ " $dest " ]]; then
       expected=0
-    elif [[ " ${clients[*]} " =~ " $source " && "$dest" == "lb_eth0" ]]; then
+    elif [[ " ${clients[*]} " =~ " $source " && "$dest" = "lb_eth0" ]]; then
       expected=0
-    elif [[ " ${backends[*]} " =~ " $source " && "$dest" == "lb_eth1" ]]; then
+    elif [[ " ${backends[*]} " =~ " $source " && "$dest" = "lb_eth1" ]]; then
       expected=0
     fi
 
-    # Measure loss %
-    result="$(mnexec -a "$pid" ping -c 2 -w 2 "${ips[$dest]}" 2>/dev/null | grep -oP '\d+(?=% packet loss)' | head -n1 || true)"
-    [[ -z "$result" ]] && result=100
-
-    ((connectivity_total++))
-    if [[ "$result" -eq "$expected" ]]; then
-      ((connectivity_correct++))
-      pass "$source → $dest : ${result}% loss (expected $expected)"
+    connectivity_total=$((connectivity_total+1))
+    if [ "$result" -eq "$expected" ]; then
+      connectivity_correct=$((connectivity_correct+1))
+      PASS "$source → $dest : $result% loss (expected $expected)"
     else
-      fail "$source → $dest : ${result}% loss (expected $expected)"
+      FAIL "$source → $dest : $result% loss (expected $expected)"
     fi
   done
 done
 
-log INFO "Connectivity: $connectivity_correct / $connectivity_total ($(pct "$connectivity_correct" "$connectivity_total")%)"
+INFO "Connectivity: $connectivity_correct / $connectivity_total tests passed"
 
 # -----------------------------
-# STEP 4.5: Start backend + LB
+# STEP 4.5: start servers (WORKING)
 # -----------------------------
-step "Starting backend servers and load balancer"
+INFO "Using SAMPLE_DIR=${SAMPLE_DIR:-<NOT FOUND>}"
 
-# Fail fast if sample directory is required and missing
-if [[ ! -d "$SAMPLE_DIR" ]]; then
-  die "SAMPLE_DIR does not exist: $SAMPLE_DIR
-Set it like: SAMPLE_DIR=/home/mininet/test3/sample_code sudo ./grading_script.sh"
+if [ -z "$SAMPLE_DIR" ] || [ ! -d "$SAMPLE_DIR" ]; then
+  ERROR "sample_code directory not found. Grades will be 0 because clients/servers can't run."
+  ERROR "Fix: set SAMPLE_DIR explicitly, e.g.: SAMPLE_DIR=$SCRIPT_DIR/sample_code sudo ./grading_script.sh"
 fi
 
-# Backends
 for host in b1 b2 b3; do
-  if ! pid="$(find_mn_pid "$host")"; then
-    die "Cannot start backend: PID not found for $host"
+  pid="$(find_pid "$host")"
+  if [ -z "$pid" ]; then
+    ERROR "PID not found for $host"
+    continue
   fi
-
-  hostlog="$LOG_DIR/${host}.log"
-  # log inside namespace goes to /tmp, but also keep a copy path for convenience
-  mnexec -a "$pid" bash -lc "cd '$SAMPLE_DIR' && nohup python3 backend_server.py '${ips[$host]}' '$BACKEND_PORT' > '/tmp/${host}.log' 2>&1 &"
-  # fetch a quick tail into run dir if present later
-  log INFO "Started backend $host at ${ips[$host]}:$BACKEND_PORT (log: /tmp/${host}.log)"
-  echo "Backend $host started at ${ips[$host]}:$BACKEND_PORT" > "$hostlog"
+  mnexec -a "$pid" bash -lc "cd '$SAMPLE_DIR' && nohup python3 backend_server.py '${ips[$host]}' $BACKEND_PORT > /tmp/$host.log 2>&1 &"
 done
 
-# Load balancer
-if ! lb_pid="$(find_mn_pid "lb")"; then
-  die "Cannot start load balancer: PID not found for lb"
+lb_pid="$(find_pid "lb")"
+if [ -z "$lb_pid" ]; then
+  ERROR "PID not found for lb"
+else
+  mnexec -a "$lb_pid" bash -lc "cd '$SAMPLE_DIR' && nohup python3 load_balancer.py '${ips[lb_eth0]}' $LB_PORT > /tmp/lb.log 2>&1 &"
 fi
-mnexec -a "$lb_pid" bash -lc "cd '$SAMPLE_DIR' && nohup python3 load_balancer.py '${ips[lb_eth0]}' '$LB_PORT' > '/tmp/lb.log' 2>&1 &"
-log INFO "Started load balancer at ${ips[lb_eth0]}:$LB_PORT (log: /tmp/lb.log)"
 
 sleep 3
 
 # -----------------------------
-# STEP 5: Sequential evaluation
+# STEP 5: sequential grading (NO BLANKS)
 # -----------------------------
-step "STEP 5 — Sequential evaluation"
+INFO "STEP 5] DOING SEQUENTIAL EVALUATION"
 declare -a grades=()
-
-# Ensure clean CSV before evaluation
-rm -f "$STUDENT_ID_CSV" || true
 
 for i in {1..2}; do
   for host in h1 h2 h3; do
-    if ! pid="$(find_mn_pid "$host")"; then
-      fail "PID not found for $host (sequential)"
+    pid="$(find_pid "$host")"
+    if [ -z "$pid" ]; then
+      ERROR "PID not found for ${host}"
       grades+=("0")
       continue
     fi
 
-    logpath="$LOG_DIR/${host}_seq_${i}.log"
-    # run in FOREGROUND (sequential)
-    mnexec -a "$pid" bash -lc "cd '$SAMPLE_DIR' && python3 client.py '$REQ_COUNT' '${ips[lb_eth0]}' '$LB_PORT' > '$logpath' 2>&1" || true
+    logf="/tmp/${host}_seq_${i}.log"
+    rm -f /tmp/student_id.csv
 
-    if [[ ! -f "$STUDENT_ID_CSV" ]]; then
-      fail "$host (seq run $i): /tmp/student_id.csv not created"
+    mnexec -a "$pid" bash -lc "cd '$SAMPLE_DIR' && python3 client.py $REQ_COUNT '${ips[lb_eth0]}' $LB_PORT > '$logf' 2>&1"
+
+    if [ ! -f /tmp/student_id.csv ]; then
+      ERROR "${host} (seq run ${i}): /tmp/student_id.csv not created → grade=0"
+      tail_log "$logf"
       grades+=("0")
     else
-      verify_out="$(python3 verify_output.py "$STUDENT_ID_CSV" 2>&1 || true)"
-      grade="$(safe_grade_from_verify "$verify_out")"
-      log INFO "$host (seq run $i) grade: $grade"
+      grade="$(grade_from_verify /tmp/student_id.csv)"
+      INFO "${host} (seq run ${i}) grade: ${grade}"
       grades+=("$grade")
     fi
-
-    # reset CSV for next host
-    rm -f "$STUDENT_ID_CSV" || true
   done
 done
 
 # -----------------------------
-# STEP 6: Concurrent evaluation
+# STEP 6: concurrent grading (NO BLANKS)
 # -----------------------------
-step "STEP 6 — Concurrent evaluation"
+INFO "STEP 6] DOING CONCURRENT EVALUATION"
 
-rm -f "$STUDENT_ID_CSV" || true
+rm -f /tmp/student_id.csv
 
 pids=()
 for host in h1 h2 h3; do
-  if ! pid="$(find_mn_pid "$host")"; then
-    fail "PID not found for $host (concurrent)"
+  pid="$(find_pid "$host")"
+  if [ -z "$pid" ]; then
+    ERROR "PID not found for ${host}"
     continue
   fi
-  logpath="$LOG_DIR/${host}_conc.log"
-  mnexec -a "$pid" bash -lc "cd '$SAMPLE_DIR' && python3 client.py '$REQ_COUNT' '${ips[lb_eth0]}' '$LB_PORT' > '$logpath' 2>&1" &
+  logf="/tmp/${host}_conc.log"
+  mnexec -a "$pid" bash -lc "cd '$SAMPLE_DIR' && python3 client.py $REQ_COUNT '${ips[lb_eth0]}' $LB_PORT > '$logf' 2>&1" &
   pids+=($!)
 done
 
-# wait for all to finish
-if [[ "${#pids[@]}" -gt 0 ]]; then
-  wait "${pids[@]}" || true
-fi
+wait "${pids[@]}"
 
-if [[ ! -f "$STUDENT_ID_CSV" ]]; then
-  fail "Concurrent: /tmp/student_id.csv not created"
-  # Still append three zeros so CSV stays stable
+if [ ! -f /tmp/student_id.csv ]; then
+  ERROR "Concurrent: /tmp/student_id.csv not created → all concurrent grades=0"
+  for host in h1 h2 h3; do
+    tail_log "/tmp/${host}_conc.log"
+  done
   grades+=("0" "0" "0")
 else
-  # per-host grade: filter combined CSV by client IP
   for host in h1 h2 h3; do
     ip="${ips[$host]}"
-    tmp="$RUN_DIR/student_id_${host}_conc.csv"
-    awk -F, -v ip="$ip" 'NR==1 || $1==ip' "$STUDENT_ID_CSV" > "$tmp" || true
-    verify_out="$(python3 verify_output.py "$tmp" 2>&1 || true)"
-    grade="$(safe_grade_from_verify "$verify_out")"
-    log INFO "$host (concurrent) grade: $grade"
+    tmp="/tmp/student_id_${host}_conc.csv"
+    awk -F, -v ip="$ip" 'NR==1 || $1==ip' /tmp/student_id.csv > "$tmp"
+    grade="$(grade_from_verify "$tmp")"
+    INFO "${host} (concurrent) grade: ${grade}"
     grades+=("$grade")
-    rm -f "$tmp" || true
+    rm -f "$tmp"
   done
 fi
 
-rm -f "$STUDENT_ID_CSV" || true
+rm -f /tmp/student_id.csv
 
-# -----------------------------
-# Final summary + CSV write
-# -----------------------------
-ip_pct="$(pct "$ip_check_correct" "$ip_check_total")"
-conn_pct="$(pct "$connectivity_correct" "$connectivity_total")"
+INFO "Grades: ${grades[*]}"
 
-log INFO "Grades array: ${grades[*]:-<empty>}"
+# Same binary grading as original
+ip_check_grade=$((${ip_check_correct}/${ip_check_total}))
+connectivity_grade=$((${connectivity_correct}/${connectivity_total}))
 
-# Ensure we have exactly 9 grades (6 sequential + 3 concurrent)
-while [[ "${#grades[@]}" -lt 9 ]]; do
+# Ensure exactly 9 grade slots (fill missing with 0)
+while [ "${#grades[@]}" -lt 9 ]; do
   grades+=("0")
 done
 
-echo "$ip_pct, $conn_pct, ${grades[0]}, ${grades[1]}, ${grades[2]}, ${grades[3]}, ${grades[4]}, ${grades[5]}, ${grades[6]}, ${grades[7]}, ${grades[8]}" >> "$GRADES_CSV"
+echo "$ip_check_grade, $connectivity_grade, ${grades[0]}, ${grades[1]}, ${grades[2]}, ${grades[3]}, ${grades[4]}, ${grades[5]}, ${grades[6]}, ${grades[7]}, ${grades[8]}" >> "$GRADES_CSV"
 
-step "DONE — Grading finished"
-log INFO "Run artifacts: $RUN_DIR"
-log INFO "Grades file: $GRADES_CSV"
+INFO "STEP 7] Cleaning up..."
+sudo mn -c > /dev/null 2>&1
+tmux kill-session -t mn 2>/dev/null || true
 
+INFO "[DONE] Grading script finished."
 cat "$GRADES_CSV"
